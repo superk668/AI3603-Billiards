@@ -29,6 +29,12 @@ from bayes_opt import BayesianOptimization, SequentialDomainReductionTransformer
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
 
+# === 全局可调节参数 ===
+# 将此值调大(例如1.1~1.3)会让时间预算更激进，以提升时间利用率；调小则更保守。
+TIME_AGGRESSION = 1.5
+# 初始安全系数，越小越激进。正常范围 0.9~0.98。
+BASE_SAFETY_MARGIN = 0.8
+
 
 # ============ Adaptive Time Manager with Learning ============
 class AdaptiveTimeManager:
@@ -48,6 +54,7 @@ class AdaptiveTimeManager:
         
         # Time tracking
         self.total_time_budget = 0.0
+        self.per_game_budget = 180.0
         self.start_time = None
         self.total_games = 0
         self.current_game = 0
@@ -58,7 +65,7 @@ class AdaptiveTimeManager:
         self.game_decision_counts = deque(maxlen=20)    # Last 20 games
         
         # Adaptive parameters
-        self.time_safety_margin = 0.95  # Start conservative
+        self.time_safety_margin = BASE_SAFETY_MARGIN  # Start conservative, user-tunable
         self.estimated_avg_decisions_per_game = 30.0
         self.predicted_decision_time = 5.0  # Initial estimate
         
@@ -68,6 +75,7 @@ class AdaptiveTimeManager:
         
     def initialize(self, n_games, time_per_game=180.0):
         """Initialize for new evaluation run"""
+        self.per_game_budget = time_per_game
         self.total_time_budget = n_games * time_per_game
         self.start_time = time.time()
         self.total_games = n_games
@@ -125,55 +133,60 @@ class AdaptiveTimeManager:
             self.estimated_avg_decisions_per_game = np.mean(self.game_decision_counts)
     
     def get_time_budget(self, game_state=None):
-        """Calculate adaptive time budget for current decision"""
+        """Adaptive per-decision budget with global borrow/lend across games"""
         if self.start_time is None:
             return 8.0
-        
+
         elapsed = time.time() - self.start_time
         remaining = self.total_time_budget - elapsed
-        
-        # Apply adaptive safety margin
+
         safe_remaining = remaining * self.time_safety_margin
-        
         if safe_remaining <= 0:
             return 0.3
-        
-        # Estimate remaining decisions
+
         games_remaining = max(1, self.total_games - self.current_game)
-        
-        # Use learned average if available
-        if len(self.game_decision_counts) >= 3:
-            decisions_in_current_game = self.decisions_made
-            estimated_remaining_in_game = max(1, self.estimated_avg_decisions_per_game - decisions_in_current_game)
-            estimated_decisions_remaining = estimated_remaining_in_game + (games_remaining - 1) * self.estimated_avg_decisions_per_game
-        else:
-            estimated_decisions_remaining = games_remaining * 30
-        
-        # Base budget allocation
+
+        # Expected elapsed if we followed the nominal per-game budget
+        avg_decisions = self.estimated_avg_decisions_per_game
+        expected_elapsed = self.per_game_budget * (
+            self.current_game + self.decisions_made / max(1, avg_decisions)
+        )
+        time_delta = elapsed - expected_elapsed  # >0 means we overspent, <0 underspent
+
+        # Remaining decision estimate (current game + future games)
+        remaining_current_game = max(1, avg_decisions - self.decisions_made)
+        estimated_decisions_remaining = remaining_current_game + max(0, games_remaining - 1) * avg_decisions
+
         base_budget = safe_remaining / max(1, estimated_decisions_remaining)
-        
-        # Adjust based on game state complexity
+        base_budget *= TIME_AGGRESSION
+
+        # Borrow/lend adjustment: if we are ahead of schedule, be generous; if behind, be frugal
+        if time_delta < 0:
+            generosity = 1.0 + min(0.4, abs(time_delta) / self.per_game_budget * 0.6)
+        else:
+            generosity = 1.0 - min(0.5, time_delta / self.per_game_budget * 0.8)
+        generosity = max(0.3, generosity)
+
+        # Game-state complexity
         complexity_multiplier = 1.0
         if game_state:
             n_remaining = game_state.get('n_remaining_balls', 7)
             if n_remaining <= 2:
-                complexity_multiplier = 1.5  # Critical endgame
+                complexity_multiplier = 1.6  # Critical endgame, allow more time
             elif n_remaining >= 6:
-                complexity_multiplier = 0.8  # Early game
-        
-        # Progressive time allocation: use more time early if we have budget
+                complexity_multiplier = 0.85  # Early game, be a bit faster
+
+        # Progress-based adjustment (overall utilization)
         utilization = elapsed / self.total_time_budget if self.total_time_budget > 0 else 0
         if utilization < 0.3 and games_remaining > 5:
-            # We have plenty of time, be generous
-            complexity_multiplier *= 1.3
-        elif utilization > 0.8:
-            # Running low on time, be conservative
-            complexity_multiplier *= 0.7
-        
-        time_budget = base_budget * complexity_multiplier
-        
-        # Clamp to reasonable range
-        return max(0.3, min(20.0, time_budget))
+            complexity_multiplier *= 1.2
+        elif utilization > 0.85:
+            complexity_multiplier *= 0.75
+
+        time_budget = base_budget * generosity * complexity_multiplier
+
+        # Clamp to reasonable range, but allow hefty time for very hard shots
+        return max(0.5, min(45.0, time_budget))
     
     def get_remaining_time(self):
         if self.start_time is None:
@@ -354,12 +367,12 @@ class ParallelDynamicAgent:
         self.n_cores = min(n_cores, 32)  # Cap at 32 to avoid overhead
         
         # Search parameters - more aggressive since we have parallel processing
-        self.MIN_INITIAL_SEARCH = 3
-        self.MAX_INITIAL_SEARCH = 40   # Higher than non-parallel version
-        self.MIN_OPT_SEARCH = 2
-        self.MAX_OPT_SEARCH = 25       # Higher than non-parallel version
-        self.MIN_CANDIDATES = 12       # More candidates for parallel eval
-        self.MAX_CANDIDATES = 80       # Much higher with parallel
+        self.MIN_INITIAL_SEARCH = 20
+        self.MAX_INITIAL_SEARCH = 60   # Higher than non-parallel version
+        self.MIN_OPT_SEARCH = 20
+        self.MAX_OPT_SEARCH = 100       # Higher than non-parallel version
+        self.MIN_CANDIDATES = 60       # More candidates for parallel eval
+        self.MAX_CANDIDATES = 320       # Much higher with parallel
         
         self.pbounds = {
             'V0': (0.5, 8.0),

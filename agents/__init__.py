@@ -3,6 +3,10 @@ from .agent import Agent
 from .basic_agent import BasicAgent
 from .basic_agent_pro import BasicAgentPro
 from .new_agent import NewAgent
+from .enhanced_mcts_agent import EnhancedMCTSAgent as EnhancedMCTSAgentBase
+from .adaptive_time_mcts_agent import AdaptiveTimeMCTSAgent
+from .global_time_mcts_agent import GlobalTimeMCTSAgent
+from .parallel_time_mcts_agent import ParallelTimeMCTSAgent
 
 # VLM agents
 from .vlm_agents.VlmAssistedAgent import VLMAssistedAgent
@@ -14,9 +18,6 @@ from .search_agents.DynaHeuristicGlobal import GlobalDynamicAgent
 from .search_agents.DynaHeuristicGlobalOptimized import GlobalDynamicAgentOptimized
 from .search_agents.DynaHeuristicParallel import ParallelDynamicAgent
 from .search_agents.StrategicParallelAgent import StrategicParallelAgent
-from .search_agents.MonteCarlo import MCTSAgent
-from .search_agents.MonteCarloEnhanced import EnhancedMCTSAgent
-from .search_agents.MonteCarloParallel import ParallelMCTSAgent
 
 __all__ = [
     # Base agents
@@ -24,6 +25,10 @@ __all__ = [
     'BasicAgent',
     'BasicAgentPro',
     'NewAgent',
+    'EnhancedMCTSAgentBase',
+    'AdaptiveTimeMCTSAgent',
+    'GlobalTimeMCTSAgent',
+    'ParallelTimeMCTSAgent',
     # VLM agents
     'VLMAssistedAgent',
     # Search agents
@@ -32,8 +37,5 @@ __all__ = [
     'GlobalDynamicAgent',
     'GlobalDynamicAgentOptimized',
     'ParallelDynamicAgent',
-    'StrategicParallelAgent',
-    'MCTSAgent',
-    'EnhancedMCTSAgent',
-    'ParallelMCTSAgent',
+    'StrategicParallelAgent'
 ]

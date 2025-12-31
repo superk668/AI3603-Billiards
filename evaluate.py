@@ -13,6 +13,7 @@ evaluate.py - Agent 评估脚本
 """
 
 # 导入必要的模块
+import time
 from utils import set_random_seed
 from poolenv import PoolEnv
 from agents import (
@@ -28,9 +29,7 @@ from agents import (
     ParallelDynamicAgent,
     StrategicParallelAgent,
     # Search agents - Monte Carlo Tree Search
-    MCTSAgent,
-    EnhancedMCTSAgent,
-    ParallelMCTSAgent,
+    ParallelTimeMCTSAgent
 )
 
 # 设置随机种子，enable=True 时使用固定种子，enable=False 时使用完全随机
@@ -39,7 +38,13 @@ set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 10  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 40  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+
+# === 计时与利用率跟踪 ===
+# 假设每局3分钟总预算（与并行动态Agent内部一致），可根据需要调整。
+per_game_budget_sec = 180
+total_budget_sec = n_games * per_game_budget_sec
+run_start_ts = time.time()
 
 ## 选择对打的对手
 # agent_a, agent_b = BasicAgent(), NewAgent() # 与 BasicAgent 对打
@@ -53,10 +58,10 @@ n_games = 10  # 对战局数 自己测试时可以修改 扩充为120局为了�
 # agent_a, agent_b = BasicAgent(), GlobalDynamicAgentOptimized() # 优化的全局动态Agent
 # agent_a, agent_b = BasicAgent(), EliteDynamicAgent() # 精英动态Agent
 # agent_a, agent_b = BasicAgentPro(), ParallelDynamicAgent() # 并行动态Agent
-agent_a, agent_b = BasicAgent(), StrategicParallelAgent() # 新！战略性并行Agent（推荐）
+# agent_a, agent_b = BasicAgent(), StrategicParallelAgent() # 新！战略性并行Agent（推荐）
 # agent_a, agent_b = BasicAgent(), MCTSAgent() # 蒙特卡洛树搜索Agent
 # agent_a, agent_b = BasicAgent(), EnhancedMCTSAgent() # 增强蒙特卡洛Agent
-# agent_a, agent_b = BasicAgent(), ParallelMCTSAgent() # 并行蒙特卡洛Agent
+agent_a, agent_b = BasicAgentPro(),ParallelTimeMCTSAgent() # 并行蒙特卡洛Agent
 
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型
@@ -100,6 +105,12 @@ for i in range(n_games):
             else:
                 results[['AGENT_A_WIN', 'AGENT_B_WIN'][(i+1) % 2]] += 1
             break
+
+    # 统计并展示时间利用率
+    elapsed_sec = time.time() - run_start_ts
+    remaining_sec = max(0.0, total_budget_sec - elapsed_sec)
+    utilization_pct = min(100.0, elapsed_sec / total_budget_sec * 100)
+    print(f"[计时] 已用 {elapsed_sec:.1f}s / {total_budget_sec:.1f}s，利用率 {utilization_pct:.1f}%，剩余 {remaining_sec:.1f}s")
 
 # 计算分数：胜1分，负0分，平局0.5
 results['AGENT_A_SCORE'] = results['AGENT_A_WIN'] * 1 + results['SAME'] * 0.5
