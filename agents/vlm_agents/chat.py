@@ -13,21 +13,23 @@ import re
 
 
 class VLMChat:
-    """VLM对话接口"""
+    """VLM/LLM对话接口（支持纯文本和视觉模型）"""
     
-    def __init__(self, provider='qwen', model='qwen3-vl-flash', api_key=None, base_url=None):
+    def __init__(self, provider='qwen', model='qwen3-vl-flash', api_key=None, base_url=None, use_vision=True):
         """
-        初始化VLM客户端
+        初始化VLM/LLM客户端
         
         Args:
             provider: 'openai', 'claude', 'qwen' (阿里云Qwen)
             model: 模型名称
             api_key: API密钥（如果不提供，从环境变量读取）
             base_url: API基础URL（用于兼容OpenAI的服务，如Qwen）
+            use_vision: 是否使用视觉模型（False时仅使用文本）
         """
         self.provider = provider
         self.model = model
         self.base_url = base_url
+        self.use_vision = use_vision
         
         # 获取API密钥
         if api_key is None:
@@ -51,11 +53,13 @@ class VLMChat:
                         api_key=api_key,
                         base_url=base_url
                     )
-                    print(f"[VLMChat] Initialized Qwen client: {base_url}")
+                    mode_str = "Vision" if use_vision else "Text"
+                    print(f"[VLMChat] Initialized Qwen {mode_str} client: {base_url}")
                     print(f"[VLMChat] Model: {model}")
                 else:
                     self.client = OpenAI(api_key=api_key, base_url=base_url)
-                    print(f"[VLMChat] Initialized OpenAI client with model {model}")
+                    mode_str = "Vision" if use_vision else "Text"
+                    print(f"[VLMChat] Initialized OpenAI {mode_str} client with model {model}")
             except ImportError:
                 print("[VLMChat] Warning: openai package not installed. Install with: pip install openai")
                 self.client = None
@@ -336,6 +340,161 @@ Provide ONLY the JSON, no additional text."""
             'reasoning': 'Rule-based fallback strategy',
             'key_considerations': ['No VLM available, using heuristics']
         }
+    
+    def get_shot_parameters(self, text_description: str, return_raw_response: bool = False) -> Optional[Dict]:
+        """
+        从文本描述获取击球参数（纯文本模式，用于LLM agent）
+        
+        Args:
+            text_description: 包含游戏状态的文本描述
+            return_raw_response: 是否返回原始响应
+            
+        Returns:
+            Dict包含:
+                - V0: 初速度 (0.5-8.0)
+                - phi: 水平角度 (0-360)
+                - theta: 垂直角度 (0-90)
+                - a: 横向偏移 (-0.5-0.5)
+                - b: 纵向偏移 (-0.5-0.5)
+            如果解析失败返回None
+        """
+        
+        # 构建提示词
+        prompt = self._build_shot_prompt(text_description)
+        
+        # 调用LLM（文本模式）
+        if self.provider in ['openai', 'qwen']:
+            response = self._call_text_only(prompt)
+        elif self.provider == 'claude':
+            response = self._call_claude_text(prompt)
+        else:
+            if return_raw_response:
+                return None, prompt, "No LLM available"
+            return None
+        
+        # 解析响应
+        shot_params = self._parse_shot_response(response)
+        
+        if return_raw_response:
+            return shot_params, prompt, response
+        
+        return shot_params
+    
+    def _build_shot_prompt(self, text_description: str) -> str:
+        """构建击球参数提示词"""
+        
+        prompt = f"""You are an expert billiards player. Based on the game state description below, determine the best shot parameters.
+
+{text_description}
+
+**Your Task:**
+Choose the shot parameters to maximize the chance of pocketing your target balls while following billiards rules.
+
+**Shot Parameters:**
+- V0: Initial velocity in m/s (range: 0.5 to 8.0)
+- phi: Horizontal angle in degrees (range: 0 to 360, where 0° points to positive X-axis)
+- theta: Vertical angle in degrees (range: 0 to 90, where 0° is horizontal)
+- a: Horizontal impact offset as fraction of ball radius (range: -0.5 to 0.5)
+- b: Vertical impact offset as fraction of ball radius (range: -0.5 to 0.5)
+
+**Respond in JSON format ONLY (no additional text):**
+{{
+    "V0": <float>,
+    "phi": <float>,
+    "theta": <float>,
+    "a": <float>,
+    "b": <float>,
+    "reasoning": "<brief explanation of your shot choice>"
+}}
+
+Provide ONLY the JSON response."""
+        
+        return prompt
+    
+    def _call_text_only(self, prompt: str) -> str:
+        """调用文本模式的LLM（OpenAI/Qwen）"""
+        if self.client is None:
+            return ""
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                max_tokens=500,
+                temperature=0.3
+            )
+            
+            return response.choices[0].message.content
+            
+        except Exception as e:
+            print(f"[VLMChat] Text-only API error: {e}")
+            return ""
+    
+    def _call_claude_text(self, prompt: str) -> str:
+        """调用Claude文本模式"""
+        if self.client is None:
+            return ""
+        
+        try:
+            response = self.client.messages.create(
+                model=self.model if 'claude' in self.model else "claude-3-opus-20240229",
+                max_tokens=500,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            )
+            
+            return response.content[0].text
+            
+        except Exception as e:
+            print(f"[VLMChat] Claude text API error: {e}")
+            return ""
+    
+    def _parse_shot_response(self, response: str) -> Optional[Dict]:
+        """解析LLM的击球参数响应"""
+        try:
+            # 提取JSON
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                shot_params = json.loads(json_str)
+                
+                # 验证必需字段
+                required_fields = ['V0', 'phi', 'theta', 'a', 'b']
+                for field in required_fields:
+                    if field not in shot_params:
+                        print(f"[VLMChat] Warning: Missing field '{field}' in LLM response")
+                        return None
+                
+                # 验证和裁剪范围
+                shot_params['V0'] = float(max(0.5, min(8.0, shot_params['V0'])))
+                shot_params['phi'] = float(shot_params['phi']) % 360
+                shot_params['theta'] = float(max(0.0, min(90.0, shot_params['theta'])))
+                shot_params['a'] = float(max(-0.5, min(0.5, shot_params['a'])))
+                shot_params['b'] = float(max(-0.5, min(0.5, shot_params['b'])))
+                
+                print(f"[VLMChat] Parsed shot: V0={shot_params['V0']:.2f}, "
+                      f"phi={shot_params['phi']:.1f}°, theta={shot_params['theta']:.1f}°")
+                
+                return shot_params
+            else:
+                print("[VLMChat] No JSON found in shot response")
+                return None
+                
+        except json.JSONDecodeError as e:
+            print(f"[VLMChat] JSON parse error: {e}")
+            return None
+        except Exception as e:
+            print(f"[VLMChat] Unexpected error parsing shot response: {e}")
+            return None
 
 
 def test_vlm_chat():

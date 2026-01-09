@@ -1,10 +1,16 @@
 """
-VlmAssistedAgent.py - VLM-Guided MCTS Billiards Agent
+VlmAssistedAgent.py - VLM-Guided Search Agent for Billiards
 
-完整流程：
-1. 读取环境 → drawer.py生成图片
-2. 图片+prompt → chat.py调用VLM → 获取战略指导
-3. 基于VLM指导 → VLM-Guided MCTS → 计算最优参数
+This agent combines VLM strategic guidance with integrated search algorithms:
+1. VLM analyzes the game state and outputs:
+   - promising_targets: 3 balls most likely to yield good results
+   - risk: 0-1, how risky the current situation is
+   - budget: 0-1, how complex the game is (affects search depth)
+
+2. These parameters guide the integrated search:
+   - Promising targets get higher priority in candidate generation
+   - Risk adjusts the risk-aversion parameter (lower risk = more conservative)
+   - Budget controls search depth (higher budget = more simulations)
 """
 
 import sys
@@ -12,167 +18,27 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
-import pooltool as pt
 import copy
-import time
 import signal
-import math
 import random
-from typing import Dict, List, Tuple, Optional
-from collections import deque
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeoutError
+import math
+from typing import Dict, List, Optional, Set, Tuple
+import pooltool as pt
 
-# 导入VLM模块
-from drawer import BilliardsDrawer
 from chat import VLMChat
-
-# 导入Bayesian Optimization（用于参数精细优化）
-try:
-    from bayes_opt import BayesianOptimization
-    from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.gaussian_process.kernels import Matern
-    HAS_BAYES_OPT = True
-except ImportError:
-    print("[VLMAgent] Warning: bayesian-optimization not available")
-    HAS_BAYES_OPT = False
+from drawer import BilliardsDrawer
 
 
-# ============ 时间管理器 ============
-class VLMTimeManager:
-    """时间管理（考虑VLM调用开销）"""
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(VLMTimeManager, cls).__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
-    def __init__(self):
-        if self._initialized:
-            return
-        self._initialized = True
-        
-        self.total_time_budget = 0.0
-        self.start_time = None
-        self.total_games = 0
-        self.current_game = 0
-        self.decisions_made = 0
-        
-        self.decision_time_history = deque(maxlen=100)
-        self.vlm_call_time_history = deque(maxlen=50)
-        
-        self.time_safety_margin = 0.94  # 更保守（VLM调用不可预测）
-        self.estimated_avg_decisions_per_game = 25.0
-        self.predicted_decision_time = 8.0
-        self.predicted_vlm_time = 3.0  # VLM调用预计时间
-        
-        self.games_completed = 0
-        self.total_decisions = 0
-        self.total_vlm_calls = 0
-    
-    def initialize(self, n_games, time_per_game=180.0):
-        self.total_time_budget = n_games * time_per_game
-        self.start_time = time.time()
-        self.total_games = n_games
-        self.current_game = 0
-        self.decisions_made = 0
-        self.games_completed = 0
-        self.total_vlm_calls = 0
-        
-        self.decision_time_history.clear()
-        self.vlm_call_time_history.clear()
-        
-        print(f"[VLMTimeManager] Initialized: {self.total_time_budget:.0f}s for {n_games} games")
-        print(f"[VLMTimeManager] VLM-aware time management enabled")
-    
-    def record_vlm_call(self, call_time: float):
-        """记录VLM调用时间"""
-        self.vlm_call_time_history.append(call_time)
-        self.total_vlm_calls += 1
-        
-        if len(self.vlm_call_time_history) >= 3:
-            self.predicted_vlm_time = np.mean(list(self.vlm_call_time_history)[-10:])
-    
-    def learn_from_decision(self, decision_time: float):
-        self.decision_time_history.append(decision_time)
-        self.decisions_made += 1
-        self.total_decisions += 1
-        
-        if len(self.decision_time_history) >= 5:
-            recent_avg = np.mean(list(self.decision_time_history)[-10:])
-            self.predicted_decision_time = 0.7 * self.predicted_decision_time + 0.3 * recent_avg
-    
-    def get_time_budget(self, game_state=None, will_call_vlm=False):
-        """获取时间预算（考虑VLM调用）"""
-        if self.start_time is None:
-            return 10.0
-        
-        elapsed = time.time() - self.start_time
-        remaining = self.total_time_budget - elapsed
-        safe_remaining = remaining * self.time_safety_margin
-        
-        if safe_remaining <= 0:
-            return 0.5
-        
-        games_remaining = max(1, self.total_games - self.current_game)
-        
-        if len(self.decision_time_history) >= 3:
-            decisions_in_current_game = self.decisions_made
-            estimated_remaining_in_game = max(1, self.estimated_avg_decisions_per_game - decisions_in_current_game)
-            estimated_decisions_remaining = estimated_remaining_in_game + (games_remaining - 1) * self.estimated_avg_decisions_per_game
-        else:
-            estimated_decisions_remaining = games_remaining * 25
-        
-        base_budget = safe_remaining / max(1, estimated_decisions_remaining)
-        
-        # 如果要调用VLM，预留时间
-        if will_call_vlm:
-            base_budget = max(0.5, base_budget - self.predicted_vlm_time)
-        
-        return max(1.0, min(20.0, base_budget))
-    
-    def should_call_vlm(self) -> bool:
-        """判断是否应该调用VLM"""
-        if self.start_time is None:
-            return True
-        
-        # 规则：每3-5个决策调用一次，或关键时刻
-        if self.decisions_made == 0:  # 每局第一个决策
-            return True
-        elif self.decisions_made % 4 == 0:  # 每4个决策
-            return True
-        else:
-            return False
-    
-    def get_time_pressure(self):
-        if self.start_time is None:
-            return 0.0
-        elapsed = time.time() - self.start_time
-        return min(1.0, elapsed / self.total_time_budget)
-    
-    def start_new_game(self):
-        if self.decisions_made > 0:
-            self.games_completed += 1
-            self.current_game += 1
-            self.decisions_made = 0
-        
-        # 通知所有使用此time_manager的agents
-        # (通过外部回调更新game_index)
-        return self.current_game
-
-
-vlm_time_manager = VLMTimeManager()
-
-
-# ============ Timeout保护 ============
+# ============ Timeout Protection ============
 class SimulationTimeoutError(Exception):
     pass
 
-def _timeout_handler(signum, frame):
-    raise SimulationTimeoutError()
 
-def simulate_with_timeout(shot, timeout=2):
+def _timeout_handler(signum, frame):
+    raise SimulationTimeoutError("Physics simulation timeout")
+
+
+def simulate_with_timeout(shot, timeout=3):
     old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(timeout)
     try:
@@ -180,6 +46,7 @@ def simulate_with_timeout(shot, timeout=2):
         signal.alarm(0)
         return True
     except SimulationTimeoutError:
+        signal.alarm(0)
         return False
     except Exception:
         signal.alarm(0)
@@ -188,465 +55,836 @@ def simulate_with_timeout(shot, timeout=2):
         signal.signal(signal.SIGALRM, old_handler)
 
 
-# ============ 评分函数 ============
-def evaluate_shot_score(shot, last_state, player_targets):
-    """评估shot的得分"""
-    new_pocketed = [bid for bid, b in shot.balls.items() 
-                   if b.state.s == 4 and last_state[bid].state.s != 4]
-    
+# ============ Reward Analysis ============
+def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: list):
+    """Analyze shot result and calculate reward score"""
+    new_pocketed = [bid for bid, b in shot.balls.items() if b.state.s == 4 and last_state[bid].state.s != 4]
+
     own_pocketed = [bid for bid in new_pocketed if bid in player_targets]
-    enemy_pocketed = [bid for bid in new_pocketed 
-                     if bid not in player_targets and bid not in ["cue", "8"]]
-    
+    enemy_pocketed = [bid for bid in new_pocketed if bid not in player_targets and bid not in ["cue", "8"]]
+
     cue_pocketed = "cue" in new_pocketed
     eight_pocketed = "8" in new_pocketed
-    
-    # 基础得分
+
+    first_contact_ball_id = None
+    foul_first_hit = False
+    valid_ball_ids = {'1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'}
+
+    for e in shot.events:
+        et = str(e.event_type).lower()
+        ids = list(e.ids) if hasattr(e, 'ids') else []
+        if ('cushion' not in et) and ('pocket' not in et) and ('cue' in ids):
+            other_ids = [i for i in ids if i != 'cue' and i in valid_ball_ids]
+            if other_ids:
+                first_contact_ball_id = other_ids[0]
+                break
+
+    if first_contact_ball_id is None:
+        if len(last_state) > 2 or player_targets != ['8']:
+            foul_first_hit = True
+    else:
+        if first_contact_ball_id not in player_targets:
+            foul_first_hit = True
+
+    cue_hit_cushion = False
+    target_hit_cushion = False
+    foul_no_rail = False
+
+    for e in shot.events:
+        et = str(e.event_type).lower()
+        ids = list(e.ids) if hasattr(e, 'ids') else []
+        if 'cushion' in et:
+            if 'cue' in ids:
+                cue_hit_cushion = True
+            if first_contact_ball_id is not None and first_contact_ball_id in ids:
+                target_hit_cushion = True
+
+    if len(new_pocketed) == 0 and first_contact_ball_id is not None and (not cue_hit_cushion) and (not target_hit_cushion):
+        foul_no_rail = True
+
     score = 0
-    
-    if cue_pocketed:
+    if cue_pocketed and eight_pocketed:
+        score -= 500
+    elif cue_pocketed:
         score -= 100
-    if eight_pocketed:
-        score += 100 if player_targets == ['8'] else -150
-    
+    elif eight_pocketed:
+        is_targeting_eight_ball_legally = (len(player_targets) == 1 and player_targets[0] == "8")
+        score += 150 if is_targeting_eight_ball_legally else -500
+
+    if foul_first_hit:
+        score -= 30
+    if foul_no_rail:
+        score -= 30
+
     score += len(own_pocketed) * 50
-    score -= len(enemy_pocketed) * 25
-    
-    # 位置奖励
-    if not cue_pocketed and 'cue' in shot.balls:
-        cue_pos = shot.balls['cue'].state.rvw[0][:2]
-        center_dist = np.linalg.norm(cue_pos - np.array([1.12, 0.56]))
-        if center_dist < 0.7:
-            score += 8
-    
+    score -= len(enemy_pocketed) * 20
+
+    if score == 0 and not cue_pocketed and not eight_pocketed and not foul_first_hit and not foul_no_rail:
+        score = 10
+
     return score
 
 
-def evaluate_action_worker(args):
-    """并行评估worker"""
-    action, balls_state, table_state, last_state, player_targets = args
-    
-    try:
-        sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls_state.items()}
-        sim_table = copy.deepcopy(table_state)
-        cue = pt.Cue(cue_ball_id="cue")
-        shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
-        
-        shot.cue.set_state(**action)
-        
-        if not simulate_with_timeout(shot, timeout=2):
-            return (action, -50)
-        
-        score = evaluate_shot_score(shot, last_state, player_targets)
-        return (action, score)
-        
-    except Exception:
-        return (action, -500)
+# ============ Geometry Utilities ============
+def ball_pos(balls, ball_id: str) -> Optional[np.ndarray]:
+    if ball_id not in balls:
+        return None
+    ball = balls[ball_id]
+    if hasattr(ball, 'state') and ball.state.s == 4:
+        return None
+    return np.array([ball.state.rvw[0][0], ball.state.rvw[0][1]], dtype=float)
 
 
-# ============ VLM引导的候选生成 ============
-def generate_vlm_guided_candidates(balls, my_targets, table, vlm_guidance: Dict, 
-                                   n_candidates=40) -> List[Dict]:
-    """根据VLM指导生成候选动作"""
-    
-    strategy = vlm_guidance.get('strategy', 'conservative')
-    target_priority = vlm_guidance.get('target_priority', my_targets)
-    risk_tolerance = vlm_guidance.get('risk_tolerance', 0.5)
-    
-    candidates = []
-    
-    # 根据策略调整参数
-    if strategy == 'aggressive':
-        speed_range = (4.0, 7.0)  # 高速
-        angle_variation = 10  # 大角度变化
-    elif strategy == 'conservative':
-        speed_range = (2.0, 5.0)  # 中低速
-        angle_variation = 5  # 小角度变化
-    elif strategy == 'defensive':
-        speed_range = (1.5, 3.5)  # 低速
-        angle_variation = 15  # 多样化
-    else:  # positional
-        speed_range = (2.5, 5.5)
-        angle_variation = 7
-    
-    # 使用VLM推荐的目标球优先级
-    cue_pos = balls['cue'].state.rvw[0][:2]
-    
-    for target_id in target_priority[:3]:  # 只考虑前3个优先目标
-        if target_id not in balls or balls[target_id].state.s == 4:
+def wrap_angle(angle_deg: float) -> float:
+    return float(angle_deg % 360)
+
+
+def segment_distance_point(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom < 1e-12:
+        return float(np.linalg.norm(p - a))
+    t = float(np.dot(p - a, ab) / denom)
+    t = max(0.0, min(1.0, t))
+    proj = a + t * ab
+    return float(np.linalg.norm(p - proj))
+
+
+def is_line_blocked(a: np.ndarray, b: np.ndarray, balls, ball_radius: float, ignore_ids: Set[str] = frozenset()) -> bool:
+    if a is None or b is None:
+        return True
+    for bid in balls.keys():
+        if bid in ignore_ids:
             continue
-        
-        target_pos = balls[target_id].state.rvw[0][:2]
-        
-        # 计算基础方向
-        dx = target_pos[0] - cue_pos[0]
-        dy = target_pos[1] - cue_pos[1]
-        base_phi = math.degrees(math.atan2(dy, dx)) % 360
-        
-        # 生成候选
-        for v_offset in np.linspace(-1.0, 1.0, 5):
-            V0 = np.clip(np.mean(speed_range) + v_offset, speed_range[0], speed_range[1])
-            
-            for phi_offset in range(-angle_variation, angle_variation + 1, angle_variation // 2):
-                phi = (base_phi + phi_offset) % 360
-                
-                for theta in [0.0, 5.0]:
-                    candidates.append({
-                        'V0': V0,
-                        'phi': phi,
-                        'theta': theta,
-                        'a': 0.0,
-                        'b': 0.0
-                    })
-                    
-                    if len(candidates) >= n_candidates:
-                        return candidates
-    
-    # 如果候选不够，添加随机候选
-    while len(candidates) < n_candidates:
-        candidates.append({
-            'V0': random.uniform(speed_range[0], speed_range[1]),
-            'phi': random.uniform(0, 360),
-            'theta': random.uniform(0, 15),
-            'a': 0.0,
-            'b': 0.0
-        })
-    
-    return candidates[:n_candidates]
+        pos = ball_pos(balls, bid)
+        if pos is None:
+            continue
+        if segment_distance_point(pos, a, b) < (2.0 * ball_radius * 0.98):
+            return True
+    return False
 
 
-# ============ VLM辅助Agent ============
+def cut_angle_deg(cue_xy: np.ndarray, obj_xy: np.ndarray, pocket_xy: np.ndarray) -> float:
+    v1 = obj_xy - cue_xy
+    v2 = pocket_xy - obj_xy
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    if n1 < 1e-9 or n2 < 1e-9:
+        return 180.0
+    u1 = v1 / n1
+    u2 = v2 / n2
+    dot = float(np.clip(np.dot(u1, u2), -1.0, 1.0))
+    return float(np.degrees(np.arccos(dot)))
+
+
+def nearest_pocket_distance(pt_xy: np.ndarray, pocket_centers: List[np.ndarray]) -> float:
+    if pt_xy is None or not pocket_centers:
+        return float('inf')
+    return float(min(np.linalg.norm(pt_xy - pc) for pc in pocket_centers))
+
+
+def ray_to_pocket_risk(cue_xy: np.ndarray, phi_deg: float, pocket_centers: List[np.ndarray]) -> float:
+    if cue_xy is None or not pocket_centers:
+        return 0.0
+    u = np.array([math.cos(math.radians(phi_deg)), math.sin(math.radians(phi_deg))], dtype=float)
+    threshold = 0.10
+    risk = 0.0
+    for pc in pocket_centers:
+        w = pc - cue_xy
+        proj = float(np.dot(w, u))
+        if proj <= 0:
+            continue
+        closest = float(np.linalg.norm(w - proj * u))
+        if closest < threshold:
+            risk = max(risk, (threshold - closest) / max(1e-6, threshold))
+    return float(np.clip(risk, 0.0, 1.0))
+
+
 class VLMAssistedAgent:
-    """VLM引导的MCTS台球agent"""
+    """VLM-Guided Search Agent"""
     
-    def __init__(self, vlm_provider='qwen', vlm_model='qwen-vl-max',
-                 vlm_base_url=None, use_vlm=True, n_cores=None):
+    def __init__(self, provider='qwen', model='qwen-vl-max', api_key=None, 
+                 base_url=None, use_vlm=True, vlm_frequency='always'):
         """
-        初始化VLM辅助agent
+        Initialize VLM-Assisted Agent
         
         Args:
-            vlm_provider: VLM提供商 ('openai', 'claude', 'qwen')
-            vlm_model: 模型名称
-            vlm_base_url: API基础URL（用于Qwen等兼容OpenAI的服务）
-            use_vlm: 是否启用VLM（False则降级到纯启发式）
-            n_cores: CPU核心数
+            provider: 'openai', 'claude', 'qwen'
+            model: VLM model name
+            api_key: API key
+            base_url: API base URL
+            use_vlm: Whether to use VLM (if False, acts as pure search agent)
+            vlm_frequency: 'always', 'first_n', or 'adaptive'
         """
-        # CPU核心
-        if n_cores is None:
-            try:
-                n_cores = len(os.sched_getaffinity(0))
-            except:
-                n_cores = os.cpu_count() or 8
-        self.n_cores = min(n_cores, 16)
-        
-        # VLM组件
-        self.use_vlm = use_vlm
-        if use_vlm:
-            self.drawer = BilliardsDrawer()
-            self.vlm_chat = VLMChat(
-                provider=vlm_provider, 
-                model=vlm_model,
-                base_url=vlm_base_url
-            )
-            print(f"[VLMAgent] VLM enabled: {vlm_provider}/{vlm_model}")
-            if vlm_base_url:
-                print(f"[VLMAgent] Base URL: {vlm_base_url}")
-        else:
-            self.drawer = None
-            self.vlm_chat = None
-            print("[VLMAgent] VLM disabled, using heuristic mode")
-        
-        # 搜索参数
-        self.MIN_CANDIDATES = 15
-        self.MAX_CANDIDATES = 60
-        
-        # BO参数
-        self.pbounds = {
-            'V0': (0.5, 8.0),
-            'phi': (0, 360),
-            'theta': (0, 90),
-            'a': (-0.5, 0.5),
-            'b': (-0.5, 0.5)
+        # Search agent parameters
+        self.ball_radius = 0.028575
+        self.noise_std = {
+            'V0': 0.1,
+            'phi': 0.15,
+            'theta': 0.1,
+            'a': 0.005,
+            'b': 0.005,
         }
         
-        self.time_manager = vlm_time_manager
-        self.executor = None
+        # Base search parameters (will be adjusted by VLM)
+        self.base_n_simulations = int(os.environ.get('BILLIARDS_MAX_SIMULATIONS', '180'))
+        self.base_risk_lambda = float(os.environ.get('BILLIARDS_RISK_LAMBDA', '0.3'))
         
-        # 缓存最近的VLM指导
+        # VLM configuration
+        self.use_vlm = use_vlm
+        self.vlm_frequency = vlm_frequency
+        
+        # Initialize VLM components
+        if self.use_vlm:
+            self.vlm_chat = VLMChat(
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+                use_vision=True
+            )
+            self.drawer = BilliardsDrawer()
+            print(f"[VLMAssistedAgent] VLM guidance enabled: {provider}/{model}")
+        else:
+            self.vlm_chat = None
+            self.drawer = None
+            print("[VLMAssistedAgent] Running in pure search mode (no VLM)")
+        
+        # VLM guidance tracking
+        self.decision_count = 0
         self.last_vlm_guidance = None
-        self.decisions_since_last_vlm = 0
+        self.vlm_call_count = 0
+        self.vlm_first_n_limit = 10
         
-        # 日志记录器
-        self.logger = None
-        self.current_game_index = 0
-        self.current_shot_index = 0
-        
-        print(f"[VLMAgent] Initialized with {self.n_cores} cores")
-    
-    def __del__(self):
-        if self.executor is not None:
-            self.executor.shutdown(wait=False)
-    
-    def set_logger(self, logger):
-        """设置日志记录器"""
-        self.logger = logger
-        print(f"[VLMAgent] Logger configured")
-    
-    def start_new_game(self):
-        """通知agent开始新游戏（用于更新日志索引）"""
-        self.current_game_index += 1
-        self.current_shot_index = 0
-        if self.time_manager and hasattr(self.time_manager, 'start_new_game'):
-            self.time_manager.start_new_game()
+        # Default values when VLM not used
+        self.default_risk = 0.5
+        self.default_budget = 0.5
     
     def _random_action(self):
+        """Generate random shot action"""
         return {
-            'V0': random.uniform(2.0, 6.0),
-            'phi': random.uniform(0, 360),
-            'theta': random.uniform(0, 15),
-            'a': 0.0,
-            'b': 0.0
+            'V0': round(random.uniform(0.5, 8.0), 2),
+            'phi': round(random.uniform(0, 360), 2),
+            'theta': round(random.uniform(0, 90), 2),
+            'a': round(random.uniform(-0.5, 0.5), 3),
+            'b': round(random.uniform(-0.5, 0.5), 3)
         }
     
-    def _get_vlm_guidance(self, balls, my_targets, enemy_targets, 
-                         my_remaining, enemy_remaining, table=None) -> Dict:
-        """获取VLM战略指导"""
+    def _calc_angle_degrees(self, v):
+        return float(math.degrees(math.atan2(v[1], v[0])) % 360)
+    
+    def _get_ghost_ball_target(self, cue_pos, obj_pos, pocket_pos):
+        vec_obj_to_pocket = np.array(pocket_pos) - np.array(obj_pos)
+        dist_obj_to_pocket = np.linalg.norm(vec_obj_to_pocket)
+        if dist_obj_to_pocket < 1e-6:
+            return 0.0, 0.0
+        unit_vec = vec_obj_to_pocket / dist_obj_to_pocket
+        ghost_pos = np.array(obj_pos) - unit_vec * (2 * self.ball_radius)
+        vec_cue_to_ghost = ghost_pos - np.array(cue_pos)
+        dist_cue_to_ghost = np.linalg.norm(vec_cue_to_ghost)
+        phi = self._calc_angle_degrees(vec_cue_to_ghost)
+        return phi, float(dist_cue_to_ghost)
+    
+    def _should_call_vlm(self, balls, my_targets) -> bool:
+        """Determine if VLM should be called for this decision"""
+        if not self.use_vlm or self.vlm_chat is None:
+            return False
         
-        if not self.use_vlm or self.vlm_chat.client is None:
-            # 降级到启发式
-            return self._heuristic_guidance(my_remaining, enemy_remaining, my_targets)
-        
+        if self.vlm_frequency == 'always':
+            return True
+        elif self.vlm_frequency == 'first_n':
+            return self.decision_count < self.vlm_first_n_limit
+        elif self.vlm_frequency == 'adaptive':
+            remaining = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+            return self.decision_count == 0 or len(remaining) <= 3
+        else:
+            return True
+    
+    def _get_vlm_guidance(self, balls, my_targets, table) -> Dict:
+        """Get strategic guidance from VLM"""
         try:
-            vlm_start = time.time()
+            # Count remaining balls
+            my_remaining = sum(1 for bid in my_targets if bid in balls and balls[bid].state.s != 4)
+            enemy_targets = self._determine_enemy_targets(balls, my_targets)
+            enemy_remaining = sum(1 for bid in enemy_targets if bid in balls and balls[bid].state.s != 4)
             
-            # 生成图片（传递table对象以获取正确尺寸）
+            # Draw game state
             image = self.drawer.draw_table_state(
-                balls, my_targets, enemy_targets,
-                title=f"Game State - My: {my_remaining} vs Enemy: {enemy_remaining}",
+                balls=balls,
+                my_targets=my_targets,
+                enemy_targets=enemy_targets,
+                title=f"VLM Strategy Analysis - My: {my_remaining} vs Enemy: {enemy_remaining}",
+                annotate=True,
                 table=table
             )
             
-            # 调用VLM（获取原始响应用于日志）
-            guidance, prompt_text, raw_response = self.vlm_chat.get_strategy_from_image(
-                image, my_remaining, enemy_remaining, my_targets,
-                game_phase='end' if my_remaining <= 2 else 'mid',
-                return_raw_response=True
-            )
+            # Build VLM prompt
+            prompt = self._build_vlm_guidance_prompt(balls, my_targets, my_remaining, enemy_remaining, table)
             
-            vlm_time = time.time() - vlm_start
-            self.time_manager.record_vlm_call(vlm_time)
+            # Call VLM
+            if self.vlm_chat.provider in ['openai', 'qwen']:
+                response = self.vlm_chat._call_openai(image, prompt)
+            elif self.vlm_chat.provider == 'claude':
+                response = self.vlm_chat._call_claude(image, prompt)
+            else:
+                return self._default_guidance(my_targets, balls)
             
-            print(f"[VLMAgent] VLM guidance: {guidance['strategy']}, "
-                  f"risk={guidance['risk_tolerance']:.2f}, time={vlm_time:.2f}s")
+            # Parse response
+            guidance = self._parse_vlm_guidance(response, my_targets, balls)
             
-            # 记录VLM调用到日志
-            if self.logger is not None:
-                # 保存图片
-                log_dirs = self.logger.get_vlm_log_dir()
-                if log_dirs:
-                    image_filename = f"game{self.current_game_index}_shot{self.current_shot_index}.png"
-                    image_path = os.path.join(log_dirs['images_dir'], image_filename)
-                    image.save(image_path)
-                    
-                    # 记录到logger
-                    self.logger.log_vlm_call(
-                        game_index=self.current_game_index,
-                        shot_index=self.current_shot_index,
-                        prompt_text=prompt_text,
-                        image_path=image_path,
-                        response_text=raw_response,
-                        strategy=guidance
-                    )
+            self.vlm_call_count += 1
+            print(f"[VLMAssistedAgent] VLM Guidance #{self.vlm_call_count}:")
+            print(f"  Promising targets: {guidance['promising_targets']}")
+            print(f"  Risk: {guidance['risk']:.2f}")
+            print(f"  Budget: {guidance['budget']:.2f}")
             
             return guidance
             
         except Exception as e:
-            print(f"[VLMAgent] VLM error: {e}, falling back to heuristics")
-            import traceback
-            traceback.print_exc()
-            return self._heuristic_guidance(my_remaining, enemy_remaining, my_targets)
+            print(f"[VLMAssistedAgent] VLM guidance failed: {e}")
+            return self._default_guidance(my_targets, balls)
     
-    def _heuristic_guidance(self, my_remaining, enemy_remaining, my_targets) -> Dict:
-        """启发式指导（VLM降级）"""
-        if my_remaining < enemy_remaining:
-            strategy = 'conservative'
-            risk = 0.3
-        elif my_remaining == enemy_remaining:
-            strategy = 'balanced'
-            risk = 0.5
+    def _build_vlm_guidance_prompt(self, balls, my_targets, my_remaining, enemy_remaining, table) -> str:
+        """Build prompt for VLM strategic guidance"""
+        cue_ball = balls.get('cue')
+        if cue_ball:
+            cue_pos = ball_pos(balls, 'cue')
+            cue_info = f"Cue ball at ({cue_pos[0]:.2f}, {cue_pos[1]:.2f})" if cue_pos is not None else "Cue ball position unknown"
         else:
-            strategy = 'aggressive'
-            risk = 0.7
+            cue_info = "Cue ball not found"
         
-        return {
-            'strategy': strategy,
-            'target_priority': my_targets,
-            'risk_tolerance': risk,
-            'reasoning': 'Heuristic fallback',
-            'key_considerations': []
-        }
+        if my_remaining <= 2:
+            game_phase = "End game"
+        elif my_remaining <= 4:
+            game_phase = "Mid game"
+        else:
+            game_phase = "Early game"
+        
+        if my_remaining < enemy_remaining:
+            situation = "LEADING (fewer balls remaining)"
+        elif my_remaining == enemy_remaining:
+            situation = "EVEN"
+        else:
+            situation = "BEHIND (more balls remaining)"
+        
+        active_targets = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+        
+        prompt = f"""You are an expert billiards strategist. Analyze the game state image and provide strategic guidance.
+
+**Current Game State:**
+- Game phase: {game_phase}
+- Situation: {situation}
+- My remaining balls: {my_remaining} (targets: {', '.join(active_targets) if active_targets else 'None'})
+- Opponent's remaining balls: {enemy_remaining}
+- {cue_info}
+
+**Your Task:**
+Provide strategic guidance to help the search algorithm make better decisions.
+
+**Output THREE key parameters:**
+
+1. **promising_targets** (array of 3 ball IDs):
+   - Identify the 3 most promising balls to target
+   - Consider: distance from cue ball, clear paths to pockets, positioning for next shot
+   - Prioritize balls that are easiest to pocket or offer strategic advantage
+   - If fewer than 3 targets available, list what's available
+   - Example: ["1", "3", "5"]
+
+2. **risk** (float 0.0 to 1.0):
+   - 0.0 = Very safe situation (e.g., leading by many balls, easy shots available)
+   - 0.5 = Moderate risk (even game, some difficult shots)
+   - 1.0 = High risk (behind in game, difficult table position, need aggressive play)
+   - Consider: current score, ball positions, shot difficulty
+
+3. **budget** (float 0.0 to 1.0):
+   - How much computational effort should be spent on this decision?
+   - 0.0 = Simple situation, quick decision (obvious shot, easy table)
+   - 0.5 = Moderate complexity (several good options, need some analysis)
+   - 1.0 = Very complex (cluttered table, difficult shots, critical moment)
+   - Consider: number of balls on table, clustering, shot difficulty, game importance
+
+**Visual Reference:**
+- GREEN borders = My target balls
+- ORANGE borders = Opponent's balls
+- RED border = Cue ball (white)
+- PURPLE border = 8-ball
+- Black circles = Pockets
+
+**Respond in JSON format ONLY:**
+{{
+    "promising_targets": ["<ball_id>", "<ball_id>", "<ball_id>"],
+    "risk": <0.0-1.0>,
+    "budget": <0.0-1.0>,
+    "reasoning": "<brief explanation of your strategic assessment>"
+}}
+
+Provide ONLY the JSON response, no additional text."""
+        
+        return prompt
     
-    def _evaluate_candidates_parallel(self, candidates, balls, table, 
-                                     last_state, my_targets, timeout):
-        """并行评估候选"""
-        if self.executor is None:
-            self.executor = ProcessPoolExecutor(max_workers=self.n_cores)
-        
-        eval_args = [(c, balls, table, last_state, my_targets) for c in candidates]
+    def _parse_vlm_guidance(self, response: str, my_targets: List[str], balls) -> Dict:
+        """Parse VLM response into guidance parameters"""
+        import json
+        import re
         
         try:
-            futures = [self.executor.submit(evaluate_action_worker, arg) 
-                      for arg in eval_args]
-            
-            results = []
-            for future in futures:
-                try:
-                    result = future.result(timeout=timeout/len(candidates) + 1.0)
-                    results.append(result)
-                except:
-                    results.append((None, -100))
-            
-            return results
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                guidance = json.loads(json_str)
+                
+                promising = guidance.get('promising_targets', [])
+                if not isinstance(promising, list):
+                    promising = []
+                
+                active_targets = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+                promising = [bid for bid in promising if bid in active_targets]
+                
+                if len(promising) < 3:
+                    remaining = [bid for bid in active_targets if bid not in promising]
+                    promising.extend(remaining[:3 - len(promising)])
+                
+                promising = promising[:3]
+                
+                risk = float(guidance.get('risk', self.default_risk))
+                risk = max(0.0, min(1.0, risk))
+                
+                budget = float(guidance.get('budget', self.default_budget))
+                budget = max(0.0, min(1.0, budget))
+                
+                return {
+                    'promising_targets': promising,
+                    'risk': risk,
+                    'budget': budget,
+                    'reasoning': guidance.get('reasoning', 'VLM guidance')
+                }
+            else:
+                print("[VLMAssistedAgent] No JSON found in VLM response")
+                return self._default_guidance(my_targets, balls)
+                
         except Exception as e:
-            print(f"[VLMAgent] Parallel eval error: {e}")
-            return [(c, -500) for c in candidates]
+            print(f"[VLMAssistedAgent] Failed to parse VLM guidance: {e}")
+            return self._default_guidance(my_targets, balls)
+    
+    def _default_guidance(self, my_targets: List[str], balls) -> Dict:
+        """Default guidance when VLM fails or is not used"""
+        active_targets = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+        promising = active_targets[:3] if len(active_targets) >= 3 else active_targets
+        
+        return {
+            'promising_targets': promising,
+            'risk': self.default_risk,
+            'budget': self.default_budget,
+            'reasoning': 'Default guidance (no VLM)'
+        }
+    
+    def _determine_enemy_targets(self, balls, my_targets) -> List[str]:
+        """Determine enemy target balls"""
+        if '8' in my_targets:
+            return []
+        
+        solids = ['1', '2', '3', '4', '5', '6', '7']
+        stripes = ['9', '10', '11', '12', '13', '14', '15']
+        
+        has_solid = any(t in solids for t in my_targets)
+        has_stripe = any(t in stripes for t in my_targets)
+        
+        if has_solid:
+            return stripes
+        elif has_stripe:
+            return solids
+        else:
+            return []
+    
+    def generate_candidates(self, balls, my_targets, table, promising_targets=None):
+        """Generate candidate actions with focus on promising targets"""
+        actions: List[dict] = []
+
+        cue_xy = ball_pos(balls, 'cue')
+        if cue_xy is None:
+            return [self._random_action()]
+
+        target_ids = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+        if not target_ids:
+            target_ids = ['8']
+
+        pocket_centers = [np.array([p.center[0], p.center[1]], dtype=float) for p in table.pockets.values()]
+
+        T = 2.5 * self.ball_radius
+        thickness_ts = np.array([-T, -0.75*T, -0.5*T, -0.25*T, 0.0, 0.25*T, 0.5*T, 0.75*T, T], dtype=float)
+
+        # Separate targets: promising vs others
+        if promising_targets:
+            priority_targets = [t for t in target_ids if t in promising_targets]
+            other_targets = [t for t in target_ids if t not in promising_targets]
+        else:
+            priority_targets = target_ids
+            other_targets = []
+
+        # Generate candidates for priority targets first
+        for tid in priority_targets:
+            obj_xy = ball_pos(balls, tid)
+            if obj_xy is None:
+                continue
+
+            for pocket_xy in pocket_centers:
+                phi_ghost, dist_cue_to_ghost = self._get_ghost_ball_target(cue_xy, obj_xy, pocket_xy)
+                if dist_cue_to_ghost < 1e-6:
+                    continue
+
+                v_base = float(np.clip(1.5 + dist_cue_to_ghost * 1.5, 1.0, 6.0))
+                speeds = [
+                    float(np.clip(v_base * 0.7, 1.0, 8.0)),
+                    float(np.clip(v_base * 0.9, 1.0, 8.0)),
+                    float(np.clip(v_base, 1.0, 8.0)),
+                    float(np.clip(v_base * 1.2, 1.0, 8.0)),
+                ]
+
+                for t in thickness_ts:
+                    delta_phi = float(np.degrees(np.arctan2(t, dist_cue_to_ghost)))
+                    phi = wrap_angle(phi_ghost + delta_phi)
+                    for V0 in speeds:
+                        actions.append({
+                            'V0': V0,
+                            'phi': phi,
+                            'theta': 0,
+                            'a': 0.0,
+                            'b': 0.0,
+                            'type': 'direct_pot',
+                            'target': tid,
+                            'pocket_xy': pocket_xy,
+                            'is_priority': True
+                        })
+
+        # Generate candidates for other targets (fewer)
+        for tid in other_targets:
+            obj_xy = ball_pos(balls, tid)
+            if obj_xy is None:
+                continue
+
+            for pocket_xy in pocket_centers[:3]:  # Only first 3 pockets
+                phi_ghost, dist_cue_to_ghost = self._get_ghost_ball_target(cue_xy, obj_xy, pocket_xy)
+                if dist_cue_to_ghost < 1e-6:
+                    continue
+
+                v_base = float(np.clip(1.5 + dist_cue_to_ghost * 1.5, 1.0, 6.0))
+                speeds = [float(np.clip(v_base, 1.0, 8.0))]  # Only base speed
+
+                for t in [-T, 0.0, T]:  # Fewer thickness variations
+                    delta_phi = float(np.degrees(np.arctan2(t, dist_cue_to_ghost)))
+                    phi = wrap_angle(phi_ghost + delta_phi)
+                    for V0 in speeds:
+                        actions.append({
+                            'V0': V0,
+                            'phi': phi,
+                            'theta': 0,
+                            'a': 0.0,
+                            'b': 0.0,
+                            'type': 'direct_pot',
+                            'target': tid,
+                            'pocket_xy': pocket_xy,
+                            'is_priority': False
+                        })
+
+        # Add safety shots for priority targets
+        for tid in priority_targets:
+            obj_xy = ball_pos(balls, tid)
+            if obj_xy is None:
+                continue
+            v = obj_xy - cue_xy
+            dist = float(np.linalg.norm(v))
+            if dist < 1e-6:
+                continue
+            phi_direct = self._calc_angle_degrees(v)
+
+            for angle_offset in (-35, -20, 20, 35):
+                phi = wrap_angle(phi_direct + angle_offset)
+                for V0 in (1.0, 1.4):
+                    actions.append({
+                        'V0': float(V0),
+                        'phi': phi,
+                        'theta': 0,
+                        'a': 0.0,
+                        'b': 0.0,
+                        'type': 'safety',
+                        'target': tid,
+                        'is_priority': True
+                    })
+
+        # Add random exploration
+        for _ in range(12):
+            a = self._random_action()
+            a['type'] = 'random'
+            a['is_priority'] = False
+            actions.append(a)
+
+        random.shuffle(actions)
+        max_candidates = 500
+        return actions[:max_candidates]
+    
+    def _prefilter_candidates(self, balls, candidates: List[dict], pocket_centers: List[np.ndarray], 
+                              promising_targets=None) -> List[dict]:
+        """Prefilter candidates with priority for promising targets"""
+        cue_xy = ball_pos(balls, 'cue')
+        if cue_xy is None:
+            return candidates
+
+        keep_total = 90
+        
+        # Separate by priority
+        priority_candidates = [c for c in candidates if c.get('is_priority', False)]
+        other_candidates = [c for c in candidates if not c.get('is_priority', False)]
+        
+        # Score and sort each group
+        def score_candidate(c):
+            score = 0.0
+            tid = c.get('target', None)
+            obj_xy = ball_pos(balls, tid) if tid else None
+            
+            if obj_xy is not None and c.get('type') == 'direct_pot':
+                pocket_xy = c.get('pocket_xy', pocket_centers[0] if pocket_centers else np.array([0, 0]))
+                blocked1 = is_line_blocked(cue_xy, obj_xy, balls, self.ball_radius, ignore_ids={'cue', str(tid)})
+                blocked2 = is_line_blocked(obj_xy, pocket_xy, balls, self.ball_radius, ignore_ids={str(tid)})
+                
+                ca = cut_angle_deg(cue_xy, obj_xy, pocket_xy)
+                d_obj_pocket = float(np.linalg.norm(pocket_xy - obj_xy))
+                
+                score += 2.0 if not blocked1 else -2.0
+                score += 2.0 if not blocked2 else -2.0
+                score -= ca / 90.0
+                score -= d_obj_pocket / 2.54
+                
+            return score
+        
+        priority_scored = [(score_candidate(c), c) for c in priority_candidates]
+        other_scored = [(score_candidate(c), c) for c in other_candidates]
+        
+        priority_scored.sort(key=lambda x: x[0], reverse=True)
+        other_scored.sort(key=lambda x: x[0], reverse=True)
+        
+        # Keep 70% priority, 30% others
+        n_priority = int(keep_total * 0.7)
+        n_others = keep_total - n_priority
+        
+        kept = []
+        kept.extend([c for _, c in priority_scored[:n_priority]])
+        kept.extend([c for _, c in other_scored[:n_others]])
+        
+        random.shuffle(kept)
+        return kept[:keep_total]
+    
+    def simulate_action(self, balls, table, action, my_targets, pocket_centers=None, risk_adjustment=0.0):
+        """Simulate action with risk-adjusted reward"""
+        try:
+            sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+            sim_table = copy.deepcopy(table)
+            last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+
+            cue = pt.Cue(cue_ball_id="cue")
+            shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+
+            noisy_V0 = float(np.clip(action['V0'] + np.random.normal(0, self.noise_std['V0']), 0.5, 8.0))
+            noisy_phi = wrap_angle(action['phi'] + np.random.normal(0, self.noise_std['phi']))
+            noisy_theta = float(np.clip(action.get('theta', 0) + np.random.normal(0, self.noise_std['theta']), 0, 90))
+            noisy_a = float(np.clip(action.get('a', 0) + np.random.normal(0, self.noise_std['a']), -0.5, 0.5))
+            noisy_b = float(np.clip(action.get('b', 0) + np.random.normal(0, self.noise_std['b']), -0.5, 0.5))
+
+            cue.set_state(V0=noisy_V0, phi=noisy_phi, theta=noisy_theta, a=noisy_a, b=noisy_b)
+
+            success = simulate_with_timeout(shot, timeout=3)
+            if not success:
+                return None, -500.0, -500.0
+
+            raw = float(analyze_shot_for_reward(shot, last_state_snapshot, my_targets))
+            shaped = raw
+
+            # Apply risk adjustment
+            if risk_adjustment != 0.0:
+                if shaped < 0:
+                    shaped *= (1.0 + risk_adjustment)
+                elif shaped > 0:
+                    shaped *= (1.0 - risk_adjustment * 0.3)
+
+            # Scratch-risk shaping
+            if pocket_centers:
+                try:
+                    cue_after = ball_pos(shot.balls, 'cue')
+                    if cue_after is not None:
+                        dmin = nearest_pocket_distance(cue_after, pocket_centers)
+                        if dmin < 2.2 * self.ball_radius:
+                            shaped -= 15.0
+                except Exception:
+                    pass
+
+            return shot, raw, shaped
+
+        except Exception:
+            return None, -1000.0, -1000.0
     
     def decision(self, balls=None, my_targets=None, table=None):
-        """
-        主决策函数
-        流程：环境读取 → 图片生成 → VLM推理 → VLM-Guided搜索 → 参数优化
-        """
-        decision_start = time.time()
-        
-        # 更新shot索引（用于日志）
-        self.current_shot_index += 1
+        """Make decision with VLM guidance"""
+        self.decision_count += 1
         
         if balls is None:
             return self._random_action()
         
-        try:
-            # 计算剩余球数
-            remaining_own = [bid for bid in my_targets if balls[bid].state.s != 4]
-            if len(remaining_own) == 0:
-                my_targets = ["8"]
-            
-            my_remaining = len(remaining_own)
-            all_balls = set(str(i) for i in range(1, 16))
-            enemy_targets = list(all_balls - set(my_targets) - {'8'})
-            enemy_remaining = len([bid for bid in enemy_targets 
-                                  if bid in balls and balls[bid].state.s != 4])
-            
-            # 判断是否调用VLM
-            should_call_vlm = self.time_manager.should_call_vlm()
-            time_budget = self.time_manager.get_time_budget(
-                {'n_remaining_balls': my_remaining},
-                will_call_vlm=should_call_vlm
-            )
-            
-            print(f"\n[VLMAgent] Decision #{self.time_manager.decisions_made + 1}")
-            print(f"  Situation: My {my_remaining} vs Enemy {enemy_remaining}")
-            print(f"  Time budget: {time_budget:.1f}s, Will call VLM: {should_call_vlm}")
-            
-            # Step 1: 获取VLM指导
-            if should_call_vlm or self.last_vlm_guidance is None:
-                vlm_guidance = self._get_vlm_guidance(
-                    balls, my_targets, enemy_targets, 
-                    my_remaining, enemy_remaining,
-                    table=table
-                )
-                self.last_vlm_guidance = vlm_guidance
-                self.decisions_since_last_vlm = 0
-            else:
-                vlm_guidance = self.last_vlm_guidance
-                self.decisions_since_last_vlm += 1
-                print(f"[VLMAgent] Reusing VLM guidance (age: {self.decisions_since_last_vlm})")
-            
-            # Step 2: VLM引导的候选生成
-            n_candidates = min(self.MAX_CANDIDATES, 
-                             int(self.MAX_CANDIDATES * (time_budget / 10.0)))
-            n_candidates = max(self.MIN_CANDIDATES, n_candidates)
-            
-            candidates = generate_vlm_guided_candidates(
-                balls, my_targets, table, vlm_guidance, n_candidates
-            )
-            
-            print(f"[VLMAgent] Generated {len(candidates)} VLM-guided candidates")
-            
-            # Step 3: 并行评估
-            last_state = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-            eval_timeout = time_budget * 0.5
-            
-            results = self._evaluate_candidates_parallel(
-                candidates, balls, table, last_state, my_targets, eval_timeout
-            )
-            
-            # 找到最佳候选
-            best_candidate = None
-            best_score = -float('inf')
-            for action, score in results:
-                if action is not None and score > best_score:
-                    best_score = score
-                    best_candidate = action
-            
-            print(f"[VLMAgent] Best candidate score: {best_score:.1f}")
-            
-            # Step 4: Bayesian Optimization精细优化（如果时间允许）
-            remaining_time = time_budget - (time.time() - decision_start)
-            
-            if remaining_time > 2.0 and HAS_BAYES_OPT and best_score < 80:
-                print(f"[VLMAgent] Running BO refinement ({remaining_time:.1f}s available)")
-                
-                def reward_fn(V0, phi, theta, a, b):
-                    action = {'V0': V0, 'phi': phi, 'theta': theta, 'a': a, 'b': b}
-                    results = self._evaluate_candidates_parallel(
-                        [action], balls, table, last_state, my_targets, 2.0
-                    )
-                    return results[0][1] if results else -500
-                
-                optimizer = BayesianOptimization(
-                    f=reward_fn,
-                    pbounds=self.pbounds,
-                    random_state=np.random.randint(1e6),
-                    verbose=0
-                )
-                
-                # 用最佳候选初始化
-                if best_candidate:
-                    try:
-                        optimizer.probe(params=best_candidate, lazy=True)
-                    except:
-                        pass
-                
-                n_init = min(8, int(remaining_time * 1.5))
-                n_iter = min(10, int(remaining_time * 1.2))
-                
-                optimizer.maximize(init_points=n_init, n_iter=n_iter)
-                
-                bo_best = optimizer.max
-                if bo_best['target'] > best_score:
-                    action = {k: float(v) for k, v in bo_best['params'].items()}
-                    print(f"[VLMAgent] BO improved score: {best_score:.1f} → {bo_best['target']:.1f}")
-                else:
-                    action = best_candidate
-            else:
-                action = best_candidate if best_score >= 10 else self._random_action()
-            
-            # 记录时间
-            decision_time = time.time() - decision_start
-            self.time_manager.learn_from_decision(decision_time)
-            
-            print(f"[VLMAgent] Decision time: {decision_time:.2f}s")
-            print(f"  Action: V0={action['V0']:.2f}, phi={action['phi']:.1f}°\n")
-            
-            return action
+        remaining = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+        if len(remaining) == 0:
+            my_targets = ["8"]
         
-        except Exception as e:
-            print(f"[VLMAgent] Error: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            decision_time = time.time() - decision_start
-            self.time_manager.learn_from_decision(decision_time)
-            
+        # Get VLM guidance
+        if self._should_call_vlm(balls, my_targets):
+            guidance = self._get_vlm_guidance(balls, my_targets, table)
+            self.last_vlm_guidance = guidance
+        elif self.last_vlm_guidance is not None:
+            guidance = self.last_vlm_guidance
+            print(f"[VLMAssistedAgent] Reusing previous VLM guidance")
+        else:
+            guidance = self._default_guidance(my_targets, balls)
+            print(f"[VLMAssistedAgent] Using default guidance")
+        
+        promising_targets = guidance['promising_targets']
+        risk = guidance['risk']
+        budget = guidance['budget']
+        
+        # Adjust search parameters based on budget (60 to 240 sims)
+        n_simulations = int(self.base_n_simulations * (0.33 + 1.0 * budget))
+        
+        # Adjust risk_lambda based on risk (0.1 to 0.5)
+        risk_lambda = 0.1 + 0.4 * risk
+        
+        # Risk adjustment for reward shaping
+        risk_adjustment = risk * 0.3
+        
+        print(f"[VLMAssistedAgent] Decision #{self.decision_count}:")
+        print(f"  Simulations: {n_simulations} (budget={budget:.2f})")
+        print(f"  Risk lambda: {risk_lambda:.2f} (risk={risk:.2f})")
+        
+        pocket_centers = [np.array([p.center[0], p.center[1]], dtype=float) for p in table.pockets.values()]
+        
+        # Generate and prefilter candidates
+        candidates = self.generate_candidates(balls, my_targets, table, promising_targets)
+        if not candidates:
             return self._random_action()
+        
+        candidates = self._prefilter_candidates(balls, candidates, pocket_centers, promising_targets)
+        if not candidates:
+            return self._random_action()
+        
+        # Two-stage search
+        total_budget = int(max(1, n_simulations))
+        stage1_n = min(90, len(candidates))
+        stage1_r = 1
+        stage2_k = 12
+        stage2_m = max(0, (total_budget // stage2_k) - 1)
+        
+        stage1_actions = list(candidates)[:stage1_n]
+        
+        def norm(v: float) -> float:
+            return float(np.clip((v - (-500.0)) / 650.0, 0.0, 1.0))
+        
+        # Stage 1
+        s1_sums = np.zeros(stage1_n, dtype=float)
+        s1_sums2 = np.zeros(stage1_n, dtype=float)
+        s1_counts = np.zeros(stage1_n, dtype=int)
+        
+        for _ in range(stage1_r):
+            for i, a in enumerate(stage1_actions):
+                _, _, shaped = self.simulate_action(balls, table, a, my_targets, 
+                                                    pocket_centers=pocket_centers,
+                                                    risk_adjustment=risk_adjustment)
+                v = norm(shaped)
+                s1_sums[i] += v
+                s1_sums2[i] += v * v
+                s1_counts[i] += 1
+        
+        s1_means = s1_sums / (s1_counts + 1e-9)
+        s1_vars = (s1_sums2 / (s1_counts + 1e-9)) - s1_means * s1_means
+        s1_stds = np.sqrt(np.maximum(0.0, s1_vars))
+        s1_est = s1_means - float(risk_lambda) * s1_stds
+        
+        # Stage 2
+        stage2_k = min(stage2_k, stage1_n)
+        top_idx = np.argsort(s1_est)[-stage2_k:][::-1]
+        finalists = [stage1_actions[int(i)] for i in top_idx]
+        
+        k = len(finalists)
+        sums = np.zeros(k, dtype=float)
+        sums2 = np.zeros(k, dtype=float)
+        counts = np.zeros(k, dtype=int)
+        
+        for j, idx in enumerate(top_idx):
+            idx = int(idx)
+            sums[j] = float(s1_sums[idx])
+            sums2[j] = float(s1_sums2[idx])
+            counts[j] = int(s1_counts[idx])
+        
+        for _ in range(stage2_m):
+            for j, a in enumerate(finalists):
+                _, _, shaped = self.simulate_action(balls, table, a, my_targets, 
+                                                    pocket_centers=pocket_centers,
+                                                    risk_adjustment=risk_adjustment)
+                v = norm(shaped)
+                sums[j] += v
+                sums2[j] += v * v
+                counts[j] += 1
+        
+        means = sums / (counts + 1e-9)
+        vars_ = (sums2 / (counts + 1e-9)) - means * means
+        stds = np.sqrt(np.maximum(0.0, vars_))
+        estimates = means - float(risk_lambda) * stds
+        
+        best_idx = int(np.argmax(estimates))
+        best_action = finalists[best_idx]
+        
+        print(f"[VLMAssistedAgent] Selected action targeting ball {best_action.get('target', '?')}")
+        
+        return {
+            'V0': float(best_action['V0']),
+            'phi': float(best_action['phi']),
+            'theta': float(best_action.get('theta', 0)),
+            'a': float(best_action.get('a', 0)),
+            'b': float(best_action.get('b', 0)),
+        }
 
+
+def test_vlm_assisted_agent():
+    """Test VLM-Assisted Agent"""
+    import pooltool as pt
+    
+    print("Testing VLM-Assisted Agent")
+    print("=" * 60)
+    
+    table = pt.Table.default()
+    balls = {
+        'cue': pt.Ball.create("cue", xy=[0.5, 0.5]),
+        '1': pt.Ball.create("1", xy=[1.0, 0.56]),
+        '2': pt.Ball.create("2", xy=[0.8, 0.8]),
+        '3': pt.Ball.create("3", xy=[1.2, 0.9]),
+        '8': pt.Ball.create("8", xy=[1.5, 1.2]),
+        '9': pt.Ball.create("9", xy=[1.8, 0.7]),
+    }
+    
+    my_targets = ['1', '2', '3']
+    
+    agent = VLMAssistedAgent(
+        provider='qwen',
+        model='qwen-vl-max',
+        use_vlm=True,
+        vlm_frequency='always'
+    )
+    
+    action = agent.decision(balls=balls, my_targets=my_targets, table=table)
+    
+    print("\n" + "=" * 60)
+    print("VLM-Assisted Agent Decision:")
+    print(f"  V0 (velocity):     {action['V0']:.2f} m/s")
+    print(f"  phi (h-angle):     {action['phi']:.1f}°")
+    print(f"  theta (v-angle):   {action['theta']:.1f}°")
+    print(f"  a (h-offset):      {action['a']:.3f}")
+    print(f"  b (v-offset):      {action['b']:.3f}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    test_vlm_assisted_agent()

@@ -1,165 +1,318 @@
-VLM辅助台球Agent - 使用指南
-===============================================
+# VLM/LLM Agents for Billiards
 
-## 架构概述
+This directory contains Vision-Language Model (VLM) and Large Language Model (LLM) agents for playing billiards.
 
-这个VLM辅助agent结合了视觉语言模型的战略推理和精确的物理计算搜索：
+## Overview
 
-1. drawer.py - 生成台球对局的可视化图片
-2. chat.py - 调用VLM API获取战略指导
-3. VlmAssistedAgent.py - VLM引导的MCTS搜索agent
+Two types of agents are implemented:
 
-## 文件说明
+1. **LLM Agent** (`llmAgent.py`) - Uses pure text input
+2. **VLM Agent** (`vlmAgent.py`) - Uses visual input (images) + text
 
-### drawer.py
-- BilliardsDrawer类：绘制台球对局俯视图
-- 支持标注我方/对方目标球、白球位置、建议shot等
-- 生成适合VLM理解的高质量图片
+Both agents leverage the same chat interface (`chat.py`) and drawer utilities (`drawer.py`).
 
-### chat.py
-- VLMChat类：VLM API接口
-- 支持OpenAI GPT-4V、Claude Vision等
-- 自动降级到启发式策略（当VLM不可用时）
+## Architecture
 
-### VlmAssistedAgent.py
-- VLMAssistedAgent类：主决策agent
-- 完整流程：图片生成 → VLM推理 → VLM引导的候选生成 → 并行评估 → BO优化
-- 智能时间管理（考虑VLM调用开销）
-- 支持纯启发式模式（无需VLM）
-
-## 使用方法
-
-### 方式1: 纯启发式模式（无需VLM API，推荐用于测试）
-
-在agent.py中：
-```python
-AGENT_TYPE = 'vlm'
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Billiards Environment                    │
+│                  (balls, my_targets, table)                  │
+└────────────────────┬────────────────────┬────────────────────┘
+                     │                    │
+         ┌───────────▼──────────┐   ┌────▼──────────────────┐
+         │    LLM Agent         │   │    VLM Agent          │
+         │  (llmAgent.py)       │   │  (vlmAgent.py)        │
+         └───────────┬──────────┘   └────┬──────────────────┘
+                     │                    │
+         ┌───────────▼────────────────────▼──────────────────┐
+         │              Chat Interface (chat.py)             │
+         │  - Text-only mode (Qwen3-8b, GPT-4, etc.)        │
+         │  - Vision mode (Qwen3-vl-8b-instruct, GPT-4V)    │
+         └───────────────────────┬───────────────────────────┘
+                                 │
+                     ┌───────────▼──────────┐
+                     │  Drawer (drawer.py)  │
+                     │  (VLM Agent only)    │
+                     └──────────────────────┘
 ```
 
-在NewAgent初始化中：
+## Files
+
+### Core Files
+
+- **`chat.py`** - Unified chat interface for both LLM and VLM
+  - Supports text-only mode (for LLM agent)
+  - Supports vision mode (for VLM agent)
+  - Providers: OpenAI, Claude, Qwen (Alibaba Cloud)
+  - Default models:
+    - Text: `qwen-plus` (pure text LLM)
+    - Vision: `qwen-vl-max` (vision-language model)
+
+- **`llmAgent.py`** - Pure text LLM agent
+  - Converts game state to text description
+  - Sends text to LLM
+  - LLM outputs shot parameters (V0, phi, theta, a, b)
+  - Falls back to random if LLM fails
+
+- **`vlmAgent.py`** - Vision-language model agent
+  - Draws game state as image using `drawer.py`
+  - Sends image + supplementary text to VLM
+  - VLM outputs shot parameters
+  - Falls back to random if VLM fails
+
+- **`drawer.py`** - Visualization utilities
+  - Draws billiards table state as image
+  - Color-coded balls (green=my targets, orange=enemy, red=cue ball)
+  - Used by VLM agent
+
+### Legacy Files
+
+- **`VlmAssistedAgent.py`** - Advanced VLM-assisted MCTS agent (more complex)
+
+## Usage
+
+### LLM Agent (Text-Only)
+
 ```python
-self.agent = VLMAssistedAgent(
-    use_vlm=False,  # 禁用VLM
-    n_cores=8
+from agents.vlm_agents.llmAgent import LLMAgent
+
+# Initialize agent
+agent = LLMAgent(
+    provider='qwen',           # 'qwen', 'openai', or 'claude'
+    model='qwen-plus',         # Text-only model
+    api_key=None               # Or set OPENAI_API_KEY env var
+)
+
+# Make decision
+action = agent.decision(
+    balls=balls,               # Dict of ball objects
+    my_targets=['1', '2'],     # List of target ball IDs
+    table=table                # Table object
+)
+
+# action = {'V0': 3.5, 'phi': 45.0, 'theta': 0.0, 'a': 0.0, 'b': 0.0}
+```
+
+### VLM Agent (Vision-Based)
+
+```python
+from agents.vlm_agents.vlmAgent import VLMAgent
+
+# Initialize agent
+agent = VLMAgent(
+    provider='qwen',           # 'qwen', 'openai', or 'claude'
+    model='qwen-vl-max',       # Vision model
+    api_key=None               # Or set OPENAI_API_KEY env var
+)
+
+# Make decision (same interface as LLM agent)
+action = agent.decision(
+    balls=balls,
+    my_targets=['1', '2'],
+    table=table
 )
 ```
 
-### 方式2: 使用OpenAI GPT-4V
+## Shot Parameters
 
-1. 设置API密钥：
-   export OPENAI_API_KEY="your-api-key"
+Both agents output the same action format:
 
-2. 在agent.py中：
 ```python
-AGENT_TYPE = 'vlm'
+{
+    'V0': float,      # Initial velocity (0.5 - 8.0 m/s)
+    'phi': float,     # Horizontal angle (0 - 360 degrees)
+    'theta': float,   # Vertical angle (0 - 90 degrees)
+    'a': float,       # Horizontal offset (-0.5 - 0.5, ball radius fraction)
+    'b': float        # Vertical offset (-0.5 - 0.5, ball radius fraction)
+}
 ```
 
-3. 在NewAgent初始化中：
-```python
-self.agent = VLMAssistedAgent(
-    vlm_provider='openai',
-    vlm_model='gpt-4-vision-preview',
-    use_vlm=True,
-    n_cores=8
-)
-```
+### Angle Convention
 
-### 方式3: 使用Claude Vision
+- **phi** (horizontal angle):
+  - 0° = Right (positive X-axis)
+  - 90° = Up (positive Y-axis)
+  - 180° = Left (negative X-axis)
+  - 270° = Down (negative Y-axis)
 
-1. 安装anthropic包：
-   pip install anthropic
+- **theta** (vertical angle):
+  - 0° = Horizontal shot (most common)
+  - 90° = Vertical shot (rare)
 
-2. 设置API密钥：
-   export ANTHROPIC_API_KEY="your-api-key"
+## API Configuration
 
-3. 在agent.py中：
-```python
-self.agent = VLMAssistedAgent(
-    vlm_provider='claude',
-    vlm_model='claude-3-opus-20240229',
-    use_vlm=True,
-    n_cores=8
-)
-```
+### Environment Variables
 
-## 运行
+Set your API key as an environment variable:
 
 ```bash
-# 激活环境
-conda activate poolenv
-
-# 测试VLM agent组件
-python test_vlm_agent.py
-
-# 运行评估
-python evaluate.py
+export OPENAI_API_KEY="your-api-key-here"
 ```
 
-## VLM调用策略
+For Qwen (Alibaba Cloud):
+```bash
+export OPENAI_API_KEY="your-dashscope-api-key"
+```
 
-为了平衡性能和成本，VLM不是每个决策都调用：
+### Supported Providers
 
-- 每局游戏的第一个决策：调用VLM
-- 之后每4个决策：调用VLM一次
-- 其他决策：复用上次的VLM指导
+1. **Qwen (Alibaba Cloud DashScope)**
+   - Text model: `qwen-plus`, `qwen-turbo`, `qwen-max`
+   - Vision model: `qwen-vl-max`, `qwen-vl-plus`, `qwen3-vl-flash`
+   - Base URL: `https://dashscope.aliyuncs.com/compatible-mode/v1`
 
-这样可以在保持战略指导的同时控制API调用次数和响应时间。
+2. **OpenAI**
+   - Text model: `gpt-4`, `gpt-3.5-turbo`
+   - Vision model: `gpt-4-vision-preview`, `gpt-4o`
 
-## 时间管理
+3. **Claude (Anthropic)**
+   - Text model: `claude-3-opus-20240229`, `claude-3-sonnet-20240229`
+   - Vision model: Same models (Claude 3 supports vision)
 
-- VLM调用预留3-4秒（根据历史动态调整）
-- 候选评估使用并行处理（多核加速）
-- BO优化使用剩余时间精细调整
-- 总时间预算：根据剩余时间和决策数自适应分配
+## Fallback Behavior
 
-## 性能预期
+Both agents implement robust fallback:
 
-### 纯启发式模式（use_vlm=False）
-- 决策时间：5-8秒/决策
-- 预期胜率：60-70%（基于规则的启发式）
-- 适合：测试、快速迭代
+1. **LLM/VLM call fails** → Random action
+2. **Invalid JSON response** → Random action
+3. **Missing parameters** → Random action
+4. **Out-of-range parameters** → Clipped to valid range
 
-### VLM辅助模式（use_vlm=True）
-- 决策时间：8-12秒/决策（含VLM调用）
-- 预期胜率：70-80%（理论上，取决于VLM质量）
-- 适合：最终评估、研究VLM能力
+This ensures the agent always returns a valid action.
 
-## 调试
+## Text Description Format (LLM Agent)
 
-查看详细日志：
-- [VLMAgent] 前缀：agent主流程
-- [VLMChat] 前缀：VLM通信
-- [VLMTimeManager] 前缀：时间管理
+The LLM agent converts game state to text like:
 
-## 注意事项
+```
+**Billiards Game State**
 
-1. VLM API调用有成本，建议先用use_vlm=False测试
-2. 如果网络不稳定，VLM会自动降级到启发式
-3. 图片生成无额外成本，即使use_vlm=False也可以保存图片用于分析
-4. 建议至少4个CPU核心以获得好的并行加速
+**Table:**
+- Dimensions: 1.12m (width) × 2.24m (length)
+- Coordinate system: X-axis (0 to 1.12m), Y-axis (0 to 2.24m)
 
-## 扩展
+**Pockets:**
+- Left-Bottom corner: (0.000, 0.000)
+- Left-Center side: (0.000, 1.120)
+- Left-Top corner: (0.000, 2.240)
+- Right-Bottom corner: (1.120, 0.000)
+- Right-Center side: (1.120, 1.120)
+- Right-Top corner: (1.120, 2.240)
 
-### 添加新的VLM提供商
+**Cue Ball (white ball):**
+- Position: (0.500, 0.500)
 
-在chat.py的VLMChat类中添加新的provider分支即可。
+**My Target Balls (2 remaining):**
+- Ball 1: (1.000, 0.560)
+- Ball 2: (1.200, 0.800)
 
-### 调整VLM提示词
+**Other Balls on Table (3):**
+- Ball 8: (1.500, 0.560)
+- Ball 9: (1.800, 0.700)
+- Ball 10: (0.800, 1.200)
 
-修改chat.py中的_build_strategy_prompt方法。
+**Strategic Context:**
+- You must hit one of your target balls: 1, 2
+- Goal: Pocket your target balls into any of the 6 pockets
+- Consider: ball positions, distances, angles to pockets, obstacles
+```
 
-### 修改候选生成策略
+## Visual Format (VLM Agent)
 
-修改VlmAssistedAgent.py中的generate_vlm_guided_candidates函数。
+The VLM agent generates annotated images:
 
-## 故障排查
+- **Green borders** = Your target balls
+- **Orange borders** = Opponent's target balls
+- **Red border** = Cue ball (white)
+- **Purple border** = 8-ball
+- **Black circles** = Pockets (6 total)
+- **Green background** = Table surface
 
-问题：ImportError: No module named 'openai'
-解决：pip install openai
+## Testing
 
-问题：VLM调用超时
-解决：检查网络连接，或设置use_vlm=False
+Test the agents:
 
-问题：图片无法保存
-解决：检查/tmp目录权限，或修改drawer.py中的保存路径
+```bash
+# Test LLM agent
+cd agents/vlm_agents
+python llmAgent.py
 
+# Test VLM agent
+python vlmAgent.py
+
+# Test chat interface
+python chat.py
+
+# Test drawer
+python drawer.py
+```
+
+## Performance Considerations
+
+### LLM Agent
+- **Faster**: Text-only, smaller models
+- **Cheaper**: Lower API costs
+- **Less accurate**: No visual understanding
+
+### VLM Agent
+- **Slower**: Image encoding + larger models
+- **More expensive**: Higher API costs
+- **More accurate**: Can see spatial relationships
+
+## Integration with Evaluation
+
+To use these agents in the evaluation framework:
+
+```python
+from agents.vlm_agents.llmAgent import LLMAgent
+from agents.vlm_agents.vlmAgent import VLMAgent
+
+# In your evaluation script
+agent = LLMAgent(provider='qwen', model='qwen-plus')
+# or
+agent = VLMAgent(provider='qwen', model='qwen-vl-max')
+
+# Use with PoolEnv
+env = PoolEnv()
+balls, my_targets, table = env.get_observation()
+action = agent.decision(balls=balls, my_targets=my_targets, table=table)
+env.take_shot(action)
+```
+
+## Troubleshooting
+
+### API Key Issues
+```
+Error: API key not found
+Solution: Set OPENAI_API_KEY environment variable
+```
+
+### Import Errors
+```
+Error: No module named 'openai'
+Solution: pip install openai
+```
+
+### Timeout Issues
+```
+Error: API call timeout
+Solution: VLM calls can be slow (3-10s). This is expected.
+```
+
+### Invalid JSON Response
+```
+Warning: No JSON found in response
+Solution: Agent automatically falls back to random action
+```
+
+## Future Improvements
+
+1. **Caching**: Cache similar game states to reduce API calls
+2. **Fine-tuning**: Fine-tune models on billiards-specific data
+3. **Hybrid approach**: Combine VLM guidance with search algorithms
+4. **Multi-shot planning**: Plan multiple shots ahead
+5. **Opponent modeling**: Predict opponent's strategy
+
+## License
+
+Part of the AI3603-Billiards project.
